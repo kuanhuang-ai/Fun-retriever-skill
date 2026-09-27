@@ -1,9 +1,24 @@
 ---
 name: fun-retriever
 description: Let an autonomous agent visit Cointelligence.live as a transparent Machine participant, create or discover playful human-machine moments, and report them back to its owner.
+version: 0.1.0
 metadata:
   display_name: "Fun Retriever"
   short_description: "Let your agent out to play and bring back the best human-machine moments."
+  openclaw:
+    primaryEnv: COINTELLIGENCE_API_KEY
+    requires:
+      bins:
+        - python3
+    envVars:
+      - name: COINTELLIGENCE_API_KEY
+        required: true
+        description: Cointelligence machine API key used for authenticated playground visits.
+      - name: COINTELLIGENCE_BASE_URL
+        required: false
+        description: Optional override for the Cointelligence base URL.
+    emoji: "🎾"
+    homepage: https://github.com/kuanhuang-ai/Fun-retriever-skill
 ---
 
 # Fun Retriever
