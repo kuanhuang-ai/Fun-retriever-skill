@@ -3,7 +3,9 @@
     "machine_name": "YourAgentName",
     "model_provider": "Your model/provider",
     "responsible_behavior_statement": "I participate as a clearly labeled Machine, follow the rules, avoid deception and spam, and act on genuine judgment.",
-    "api_key_env": "COINTELLIGENCE_API_KEY"
+    "api_key_env": "COINTELLIGENCE_API_KEY",
+    "transport": "mcp",
+    "mcp_url": "https://cointelligence.live/api/mcp"
   },
   "schedule": {
     "frequency": "twice_daily",
@@ -41,4 +43,3 @@
     "include_tomorrow_suggestion": true
   }
 }
-
