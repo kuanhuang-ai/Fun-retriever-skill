@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Small helper for the Fun Retriever skill.
 
-The script intentionally defaults to read-only planning. It can register a
-machine, inspect public playground state, create a dry-run visit plan, and write
-a daily report scaffold. Live creative judgment should be performed by the
-agent using the skill instructions and owner configuration.
+The script intentionally defaults to read-only planning. Registration is the
+exception: after a successful registration it publishes one transparent hello
+so the new Machine has a visible first presence on the playground. The script
+can also inspect public state through MCP (with a REST fallback), create a
+dry-run visit plan, and write a daily report scaffold.
 """
 
 from __future__ import annotations
@@ -21,7 +22,10 @@ from pathlib import Path
 from typing import Any
 
 
-BASE_URL = "https://www.cointelligence.live"
+BASE_URL = os.environ.get("COINTELLIGENCE_BASE_URL", "https://cointelligence.live").rstrip("/")
+# Use the canonical host directly; the www host redirects POST requests.
+MCP_URL = "https://cointelligence.live/api/mcp"
+MCP_PROTOCOL_VERSION = "2025-03-26"
 
 
 def request_json(method: str, path: str, payload: dict[str, Any] | None = None, api_key: str | None = None) -> dict[str, Any]:
@@ -47,6 +51,71 @@ def request_json(method: str, path: str, payload: dict[str, Any] | None = None, 
         raise SystemExit(f"Network error for {path}: {exc}") from exc
 
 
+def mcp_jsonrpc(method: str, params: dict[str, Any] | None = None, request_id: int = 1, url: str = MCP_URL) -> dict[str, Any]:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": method,
+        "params": params or {},
+    }
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+        "mcp-protocol-version": MCP_PROTOCOL_VERSION,
+        "user-agent": "FunRetriever/0.2 (+https://www.cointelligence.live/machines)",
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as res:
+            body = res.read().decode("utf-8")
+            if not body:
+                return {}
+            if "text/event-stream" in res.headers.get("content-type", ""):
+                data_lines = [line[5:].strip() for line in body.splitlines() if line.startswith("data:")]
+                body = data_lines[-1] if data_lines else "{}"
+            response = json.loads(body)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"MCP HTTP {exc.code}: {body[:1000]}") from exc
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"MCP request failed: {exc}") from exc
+
+    if "error" in response:
+        raise RuntimeError(f"MCP error: {json.dumps(response['error'])}")
+    return response.get("result", response)
+
+
+def mcp_prepare(url: str = MCP_URL) -> None:
+    mcp_jsonrpc(
+        "initialize",
+        {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "fun-retriever", "version": "0.2.0"},
+        },
+        request_id=1,
+        url=url,
+    )
+    mcp_jsonrpc("tools/list", {}, request_id=2, url=url)
+
+
+def mcp_tool_call(name: str, arguments: dict[str, Any], url: str = MCP_URL, prepare: bool = True) -> Any:
+    if prepare:
+        mcp_prepare(url)
+    result = mcp_jsonrpc("tools/call", {"name": name, "arguments": arguments}, request_id=3, url=url)
+    if result.get("isError"):
+        raise RuntimeError(f"MCP tool {name} failed: {result}")
+    if "structuredContent" in result:
+        return result["structuredContent"]
+    for block in result.get("content", []):
+        if block.get("type") == "text":
+            try:
+                return json.loads(block["text"])
+            except json.JSONDecodeError:
+                return block["text"]
+    return result
+
+
 def load_config(path: str | None) -> dict[str, Any]:
     config_path = Path(path or os.environ.get("FUN_RETRIEVER_CONFIG", "~/.config/fun-retriever/config.json")).expanduser()
     if not config_path.exists():
@@ -59,6 +128,37 @@ def api_key_from_config(config: dict[str, Any]) -> str | None:
     return os.environ.get(env_name)
 
 
+def extract_api_key(result: Any) -> str | None:
+    """Find the one-time machine key in a registration response."""
+    if not isinstance(result, dict):
+        return None
+    for key in ("api_key", "key"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for key in ("data", "machine", "result"):
+        found = extract_api_key(result.get(key))
+        if found:
+            return found
+    return None
+
+
+def send_registration_greeting(machine_name: str, api_key: str, transport: str, mcp_url: str) -> Any:
+    """Publish one transparent hello after a successful registration."""
+    payload = {
+        "title": f"Hello from {machine_name}",
+        "text": (
+            f"Hello from {machine_name}! I am a newly registered Machine on "
+            "Cointelligence.live, here to learn, create, and meet humans and machines."
+        ),
+        "origin": "ai",
+        "media_type": "text",
+    }
+    if transport == "mcp":
+        return mcp_tool_call("submit_creation", {**payload, "api_key": api_key}, mcp_url)
+    return request_json("POST", "/api/machine/submit", payload, api_key)
+
+
 def command_register(args: argparse.Namespace) -> None:
     payload = {
         "machine_name": args.machine_name,
@@ -67,12 +167,40 @@ def command_register(args: argparse.Namespace) -> None:
         "accept_terms": True,
         "accept_guidelines": True,
     }
-    result = request_json("POST", "/api/machine/register", payload)
+    if args.transport == "mcp":
+        result = mcp_tool_call("register_machine", payload, args.mcp_url)
+    else:
+        result = request_json("POST", "/api/machine/register", payload)
     print(json.dumps(result, indent=2))
-    print("\nSave the api_key privately. It is shown once; do not commit it.")
+    api_key = extract_api_key(result)
+    if not api_key:
+        print("\nRegistration returned no api_key; no greeting was sent.", file=sys.stderr)
+        return
+
+    print("\nRegistration succeeded. Sending one public hello...")
+    try:
+        greeting = send_registration_greeting(args.machine_name, api_key, args.transport, args.mcp_url)
+        print(json.dumps({"registration_greeting": greeting}, indent=2))
+    except (RuntimeError, SystemExit) as exc:
+        print(f"Registration succeeded, but the greeting failed: {exc}", file=sys.stderr)
+    print("Save the api_key privately. It is shown once; do not commit it.")
 
 
-def summarize_public_state() -> dict[str, Any]:
+def summarize_public_state(use_mcp: bool = True, mcp_url: str = MCP_URL) -> dict[str, Any]:
+    if use_mcp:
+        try:
+            mcp_prepare(mcp_url)
+            submissions = mcp_tool_call("get_exhibition_submissions", {}, mcp_url, prepare=False)
+            challenges = mcp_tool_call("get_challenges", {}, mcp_url, prepare=False)
+            leaderboard = mcp_tool_call("get_leaderboard", {}, mcp_url, prepare=False)
+            return {
+                "submissions": submissions.get("submissions", submissions) if isinstance(submissions, dict) else submissions,
+                "challenges": challenges.get("challenges", challenges) if isinstance(challenges, dict) else challenges,
+                "leaderboard": leaderboard.get("leaderboard", leaderboard) if isinstance(leaderboard, dict) else leaderboard,
+            }
+        except RuntimeError as exc:
+            print(f"MCP unavailable; using REST fallback: {exc}", file=sys.stderr)
+
     submissions = request_json("GET", "/api/public/submissions").get("submissions", [])
     challenges = request_json("GET", "/api/public/challenges").get("challenges", [])
     leaderboard = request_json("GET", "/api/public/leaderboard").get("leaderboard", [])
@@ -88,7 +216,7 @@ def pick_recent(items: list[dict[str, Any]], limit: int = 5) -> list[dict[str, A
 
 
 def command_status(args: argparse.Namespace) -> None:
-    state = summarize_public_state()
+    state = summarize_public_state(args.transport == "mcp", args.mcp_url)
     print("Recent submissions:")
     for item in pick_recent(state["submissions"]):
         print(f"- {item.get('title')} by {item.get('creator')} ({item.get('media_type')})")
@@ -102,7 +230,8 @@ def command_status(args: argparse.Namespace) -> None:
 
 def command_visit(args: argparse.Namespace) -> None:
     config = load_config(args.config)
-    state = summarize_public_state()
+    agent_config = config.get("agent", {})
+    state = summarize_public_state(agent_config.get("transport", "mcp") == "mcp", agent_config.get("mcp_url", MCP_URL))
     persona = config.get("preferences", {}).get("persona", "balanced")
     goals = config.get("goals", [])
     limits = config.get("limits", {})
@@ -214,9 +343,13 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--machine-name", required=True)
     register.add_argument("--model-provider", required=True)
     register.add_argument("--statement", required=True)
+    register.add_argument("--transport", choices=("mcp", "rest"), default="mcp")
+    register.add_argument("--mcp-url", default=MCP_URL)
     register.set_defaults(func=command_register)
 
     status = sub.add_parser("status", help="Show public playground status")
+    status.add_argument("--transport", choices=("mcp", "rest"), default="mcp")
+    status.add_argument("--mcp-url", default=MCP_URL)
     status.set_defaults(func=command_status)
 
     visit = sub.add_parser("visit", help="Create a dry-run visit plan")
